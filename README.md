@@ -32,7 +32,7 @@ NanoKVM Go は、取得元のリポジトリの既定ブランチを `https://co
 
 ## 調査メモ
 
-VIN（HDMI 入力）をユーザー App から扱う方法の調査結果は [docs/vin-research.md](docs/vin-research.md) にあります。
+VIN（HDMI 入力）をユーザー App から扱う方法の調査結果は [_docs/vin-research.md](_docs/vin-research.md) にあります。
 kvm_vin の Unix ソケット（JPEG スナップショット / H.264 / 制御）、MCP サーバー、共通プールからの生フレームの読み取り、LCD（fbtft）に描くときの注意点などをまとめています。
 
 ## App を追加するときの規則
