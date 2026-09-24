@@ -613,34 +613,91 @@ class SourceChanged(Exception):
     """The HDMI mode changed under a read(); args[0] is the new (w, h)."""
 
 
+class _Swscale:
+    """libswscale via ctypes, without importing PyAV.
+
+    `import av` maps PyAV's whole bundled FFmpeg (83 shared objects, ~58 MB:
+    libavcodec, SVT-AV1, gnutls, libvpx, ...) and takes 10-20 s on this
+    119 MB device once memory is tight. Scaling needs only libswscale and
+    libavutil, which PyAV's wheel ships as small standalone libraries
+    (~1.4 MB, depending on libc/libm only), so they are loaded directly.
+    """
+
+    SWS_FAST_BILINEAR = 1
+    _GLOBS = ("/usr/local/lib/python3*/dist-packages/av.libs",
+              "/usr/lib/python3*/dist-packages/av.libs")
+    _instance = None
+
+    @classmethod
+    def get(cls):
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    def __init__(self):
+        import glob
+
+        paths = None
+        for pattern in self._GLOBS:
+            for d in glob.glob(pattern):
+                u = glob.glob(d + "/libavutil-*.so*")
+                s = glob.glob(d + "/libswscale-*.so*")
+                if u and s:
+                    paths = u[0], s[0]
+                    break
+            if paths:
+                break
+        if paths:
+            avutil = ctypes.CDLL(paths[0], mode=ctypes.RTLD_GLOBAL)
+            sws = ctypes.CDLL(paths[1])
+        else:  # a distro FFmpeg instead of the PyAV wheel
+            from ctypes.util import find_library
+
+            avutil = ctypes.CDLL(find_library("avutil"),
+                                 mode=ctypes.RTLD_GLOBAL)
+            sws = ctypes.CDLL(find_library("swscale"))
+        avutil.av_get_pix_fmt.argtypes = [ctypes.c_char_p]
+        avutil.av_get_pix_fmt.restype = ctypes.c_int
+        sws.sws_getContext.argtypes = [ctypes.c_int] * 7 + [ctypes.c_void_p] * 3
+        sws.sws_getContext.restype = ctypes.c_void_p
+        sws.sws_freeContext.argtypes = [ctypes.c_void_p]
+        ptrs, ints = ctypes.c_void_p * 4, ctypes.c_int * 4
+        sws.sws_scale.argtypes = [ctypes.c_void_p, ptrs, ints, ctypes.c_int,
+                                  ctypes.c_int, ptrs, ints]
+        sws.sws_scale.restype = ctypes.c_int
+        self.lib = sws
+        self.fmt = {name: avutil.av_get_pix_fmt(name.encode())
+                    for name in ("yuyv422", "rgb565le")}
+
+
+def _aligned(size, align=32):
+    """(owner, writable memoryview, address) of `size` bytes aligned to
+    `align`, so swscale's NEON paths can use aligned loads/stores."""
+    raw = bytearray(size + align)
+    addr = ctypes.addressof(ctypes.c_char.from_buffer(raw))
+    off = (-addr) % align
+    return raw, memoryview(raw)[off:off + size], addr + off
+
+
 class RawScaler:
     """RawFrameReader -> RGB565LE at a fixed output size, minimal copying.
 
-    Per frame: one decimating copy from the pool into a reused PyAV frame,
-    then swscale. Reusing the source frame also reuses its SwsContext; a new
-    frame per call rebuilds it and makes scaling ~4x slower. swscale runs
-    with FAST_BILINEAR, which on this SoC is ~1.5x faster than the default
-    BILINEAR and no slower than POINT or a 1:1 colour conversion.
-
-    transpose="clock"/"cclock" additionally rotates the output 90 degrees in
-    the same libavfilter graph (scale -> rgb565le -> transpose), so a panel
-    driven at rotate=90/270 can take whole physical rows instead of one
-    strided copy per column.
+    Per frame: one decimating copy from the pool into an aligned buffer,
+    then one sws_scale() (FAST_BILINEAR: on this SoC ~1.5x faster than the
+    default BILINEAR and no slower than POINT or a 1:1 colour conversion)
+    into another. The SwsContext and both buffers are reused until the
+    geometry changes; libswscale is called through ctypes (see _Swscale).
 
     grab() returns the output as a memoryview of uint16 pixels plus its line
-    stride in pixels (the plane may be padded), valid until the next grab().
-    With transpose the image is height x width.
+    stride in pixels (lines are padded), valid until the next grab().
     """
 
     def __init__(self, reader, width, height, row_step=None, col_step=None,
-                 crop=None, transpose=None):
-        import av
-
+                 crop=None):
         self.reader = reader
-        self.transpose = transpose
-        self._av = av
-        self._src = None
-        self._graph = None
+        self._sws = _Swscale.get()
+        self._ctx = None
+        self._key = None
         self.set_view(width, height, crop, row_step, col_step)
 
     def set_view(self, width, height, crop=None, row_step=None, col_step=None):
@@ -651,13 +708,37 @@ class RawScaler:
         within VIN's reuse window while leaving swscale something to filter.
         """
         self.width, self.height, self.crop = width, height, crop
-        self._graph = None
         if row_step is None or col_step is None:
             _, _, cw, ch = self.reader._crop(
                 crop, self.reader.source_size() or (3840, 2160))
             row_step = max(1, ch // height)
             col_step = max(1, cw // (2 * width))
         self.row_step, self.col_step = row_step, col_step
+
+    def close(self):
+        if self._ctx:
+            self._sws.lib.sws_freeContext(self._ctx)
+        self._ctx = self._key = None
+
+    def _prepare(self, sw, sh):
+        key = (sw, sh, self.width, self.height)
+        if key == self._key:
+            return
+        self.close()
+        ctx = self._sws.lib.sws_getContext(
+            sw, sh, self._sws.fmt["yuyv422"], self.width, self.height,
+            self._sws.fmt["rgb565le"], _Swscale.SWS_FAST_BILINEAR,
+            None, None, None)
+        if not ctx:
+            raise OSError("sws_getContext(%dx%d -> %dx%d) failed" % key)
+        src_line = (sw * 2 + 31) & ~31
+        dst_line = (self.width * 2 + 31) & ~31
+        self._src = _aligned(src_line * sh) + (src_line,)
+        self._dst = _aligned(dst_line * self.height) + (dst_line,)
+        ptrs, ints = ctypes.c_void_p * 4, ctypes.c_int * 4
+        self._args = (ptrs(self._src[2]), ints(src_line),
+                      ptrs(self._dst[2]), ints(dst_line))
+        self._ctx, self._key = ctx, key
 
     def grab(self, timeout=1.0):
         """Returns (RawFrame, pixels, line_px), or None if there is no frame
@@ -668,47 +749,21 @@ class RawScaler:
             return None
         sw, sh = self.reader.geometry(self.row_step, self.col_step, self.crop,
                                       size)
-        if self._src is None or (self._src.width, self._src.height) != (sw, sh):
-            self._src = self._av.VideoFrame(sw, sh, "yuyv422")
-            self._graph = None
-        plane = self._src.planes[0]
+        self._prepare(sw, sh)
+        _, src_view, _, src_line = self._src
         try:
             frame = self.reader.read(self.row_step, self.col_step, timeout,
-                                     out=plane, out_line_size=plane.line_size,
+                                     out=src_view, out_line_size=src_line,
                                      crop=self.crop, expect_size=size)
         except SourceChanged:
             return None
         if frame is None:
             return None
-        if self.transpose:
-            out = self._run_graph().planes[0]
-        else:
-            out = self._src.reformat(width=self.width, height=self.height,
-                                     format="rgb565le",
-                                     interpolation="FAST_BILINEAR").planes[0]
-        return frame, memoryview(out).cast("H"), out.line_size // 2
-
-    def _run_graph(self):
-        key = (self._src.width, self._src.height, self.width, self.height)
-        if self._graph is None or self._graph[0] != key:
-            from fractions import Fraction
-
-            g = self._av.filter.Graph()
-            node = g.add_buffer(width=key[0], height=key[1], format="yuyv422",
-                                time_base=Fraction(1, 60))
-            for name, args in (
-                    ("scale", "%d:%d:flags=fast_bilinear" % key[2:]),
-                    ("format", "rgb565le"),
-                    ("transpose", self.transpose),
-                    ("buffersink", None)):
-                nxt = g.add(name, args) if args else g.add(name)
-                node.link_to(nxt)
-                node = nxt
-            g.configure()
-            self._graph = (key, g)
-        g = self._graph[1]
-        g.push(self._src)
-        return g.pull()
+        src_ptrs, src_strides, dst_ptrs, dst_strides = self._args
+        self._sws.lib.sws_scale(self._ctx, src_ptrs, src_strides, 0, sh,
+                                dst_ptrs, dst_strides)
+        _, dst_view, _, dst_line = self._dst
+        return frame, dst_view.cast("H"), dst_line // 2
 
 
 def yuyv_to_rgb565(frame, width, height):
@@ -735,7 +790,8 @@ def _packed_plane(frame, width, height):
 
 
 # ---------------------------------------------------------------------------
-# Decoding helpers (need PyAV, which the stock image ships as python3-av)
+# Decoding helpers (need PyAV, installed from pip on the stock image;
+# imported lazily because it is slow to load, see _Swscale)
 # ---------------------------------------------------------------------------
 
 def jpeg_to_rgb565(jpeg, width, height, lowres=3):

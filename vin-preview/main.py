@@ -62,33 +62,6 @@ def blit_rgb565(fb, x0, y0, w, h, pixels, line_px=None):
                 fb.put_pixel(x0 + x, y0 + y, src[y * ls + x])
 
 
-# avfilter transpose direction that turns a logical image into physical
-# framebuffer rows for each panel rotation.
-TRANSPOSE_FOR = {90: "clock", 270: "cclock"}
-
-
-def blit_rotated(fb, x0, y0, w, h, pixels, line_px):
-    """Copy an image already rotated by TRANSPOSE_FOR[fb.rotate].
-
-    pixels is h pixels wide and w lines tall; each line is one physical
-    framebuffer row. When the image spans the panel's full physical width
-    (h == phys_w) and the strides match, this is a single copy.
-    """
-    dst = memoryview(fb._buf).cast("H")
-    row = fb.stride // 2
-    if fb.rotate == 90:
-        first, col = x0, fb.phys_w - (y0 + h)
-    else:  # 270
-        first, col = fb.phys_h - x0 - w, y0
-    src = memoryview(pixels).cast("B").cast("H")
-    if h == row and line_px == row:
-        dst[first * row:(first + w) * row] = src[:w * row]
-        return
-    for i in range(w):
-        off = (first + i) * row + col
-        dst[off:off + h] = src[i * line_px:i * line_px + h]
-
-
 def draw_disc(fb, cx, cy, r, color):
     # One vertical span per column: under rotate 90/270 that is a single
     # contiguous run in fill_rect.
@@ -201,8 +174,7 @@ def main(ctx):
         view.area = tracker.rect or (0, 0) + src
         dx, dy, dw, dh, crop = view.layout()
         if scaler is None:
-            scaler = vin.RawScaler(reader, dw, dh, crop=crop,
-                                   transpose=TRANSPOSE_FOR.get(fb.rotate))
+            scaler = vin.RawScaler(reader, dw, dh, crop=crop)
         else:
             scaler.set_view(dw, dh, crop)
         state["layout"] = (dx, dy, dw, dh)
@@ -289,10 +261,7 @@ def main(ctx):
             fb.clear(0)
         _, pixels, line_px = got
         dx, dy, dw, dh = state["layout"]
-        if scaler.transpose:
-            blit_rotated(fb, dx, dy, dw, dh, pixels, line_px)
-        else:
-            blit_rgb565(fb, dx, dy, dw, dh, pixels, line_px)
+        blit_rgb565(fb, dx, dy, dw, dh, pixels, line_px)
         state["dirty"] = draw_glows(time.monotonic())
 
     # The panel is an fbtft SPI display with deferred I/O: while it pushes a
@@ -306,6 +275,8 @@ def main(ctx):
         # sleep() here would last ~10 ms (no high-res timers).
         ctx.run(tick, fps=0, on_tap=on_tap, on_swipe=on_swipe)
     finally:
+        if scaler:
+            scaler.close()
         reader.close()
 
 

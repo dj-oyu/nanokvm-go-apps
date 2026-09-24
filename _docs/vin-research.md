@@ -40,10 +40,11 @@ HDMI → LT7911 (lt7911_manage.ko, /proc/lt7911_info/*)
 
 #### コピーを最小にしたパイプライン（`RawScaler`）
 
-1 フレームあたりのコピーは「プール → PyAV フレーム（間引きを兼ねる、行ごとに 1 回）」「swscale」「回転しながら fb の back buffer へ（列ごとに 1 回）」「flush」だけ。
+1 フレームあたりのコピーは「プール → 入力バッファ（間引きを兼ねる、行ごとに 1 回）」「swscale」「回転しながら fb の back buffer へ（列ごとに 1 回）」「flush」だけ。
 
 - 行の間引き: 必要な行だけを読む。横の間引き: YUYV のマクロピクセル（2 画素 = 32bit）単位のストライド付き memoryview 代入で、同じコピーの中で行う。
-- **入力の PyAV フレームを使い回す**。`VideoFrame.reformat()` はフレームごとに SwsContext を作り直すので、毎回新しいフレームを作ると swscale が約 4 倍遅くなる（17.8ms → 4.4ms）。
+- **SwsContext と入出力バッファを使い回す**。PyAV の `VideoFrame.reformat()` はフレームごとに SwsContext を作り直すので、毎回新しいフレームを作ると swscale が約 4 倍遅くなる（17.8ms → 4.4ms）。
+- **PyAV は import しない。libswscale を ctypes で直接呼ぶ**（`_Swscale`）。理由は下の「起動が遅い」を参照。
 - swscale の出力プレーン（行末パディングあり）から、`bytes()` や `join` を通さず、行ストライドを指定して直接 blit する。
 - 完成から 8ms 以内のフレームは待たずに使う（`AX_SYS_GetCurPTS` と meta の pts を比べる）。古ければ次のフレームを待つ。
 
@@ -185,7 +186,7 @@ serverInfo は `nanokvm-remote-control v1.0.0`。resources / prompts は空。
 
 ## サンプル
 
-- [`vin-preview/nanokvm_vin.py`](../vin-preview/nanokvm_vin.py) — 生フレームの読み取りと、上記 3 ソケットのクライアント（ctypes と標準ライブラリのみ。変換ヘルパーだけ PyAV を使う）
+- [`vin-preview/nanokvm_vin.py`](../vin-preview/nanokvm_vin.py) — 生フレームの読み取りと、上記 3 ソケットのクライアント（ctypes と標準ライブラリのみ。縮小・色変換は PyAV の wheel に同梱の libswscale を ctypes で呼ぶ。JPEG のデコードなどソケット経路の補助関数だけ PyAV を使う）
 - [`vin-preview/main.py`](../vin-preview/main.py) — appbase App。HDMI 入力を LCD にプレビューする（RAW のみ、テキスト表示なし）。
   - **長辺・短辺はフレーム全体ではなく、中身が映っている範囲（画像領域）を基準にする**。スマホのミラーリングでは、縦長のときは 16:9 のフレームの中央に置かれ左右が黒帯になり、横長のときはフレームいっぱいで余白がない。
     画像領域は `RawFrameReader.content_rect()`（0.5 秒ごとに `ContentScanner` が呼ぶ）+ `ContentTracker` で検出する。
@@ -203,10 +204,10 @@ serverInfo は `nanokvm-remote-control v1.0.0`。resources / prompts は空。
   - HDMI の解像度の変化に追従する: VIN が使うブロックの切り替え（プールの全ブロックを map し、メタ領域で毎回判定）、連番の振り直し（最新の判定は pts で行う）、行のストライド（`pic_stride`）、取得の途中で解像度が変わった場合（`SourceChanged`）に対応。
     kvm_vin が再起動してプールが動いた場合は、フレームが 2 秒来なければ `refresh()` で map し直す。無信号のまま起動しても落ちない。
     ※ 実際に解像度を変えたり、kvm_vin を再起動したりしての確認はまだしていない。
-  - 起動直後の約 5 秒は画面が黒いまま（PyAV の import が、メモリ不足で swap から読み戻すため遅い）。
+  - 起動から最初のフレームまで約 1.6 秒（PyAV を使っていた 0.2.0 までは 12–25 秒。下の「起動が遅い」を参照）。
   - 画面の端から始めた横スワイプは、ホストの終了ジェスチャー（左右の端 40px）と重なるので、中央寄りから行う。
   - タップした位置は光る円で示す（0.4 秒）。
-  - 画面なしの計測: fit 59.6fps、cover 59.1fps（VIN の全フレームに追いつく）。同じフレームを 2 回処理しないよう、前回より新しい連番のフレームだけを使う。
+  - 画面なしの計測: fit 58fps、cover 48fps。同じフレームを 2 回処理しないよう、前回より新しい連番のフレームだけを使う。
 
 #### 縮小・色変換・描画の詰め（実測）
 
@@ -215,11 +216,21 @@ serverInfo は `nanokvm-remote-control v1.0.0`。resources / prompts は空。
   YUV→RGB は係数の掛け算が必要なので、ビットシフトだけにはできない（ビットシフトで済むのは RGB565 への詰め込みだけ）。
   参考: 色を捨てたグレースケール（Y を `bytes.translate` の表引き 2 回で RGB565 に）でも 2.9–4.7ms で、FAST_BILINEAR のカラー変換より速くない。
 - **「縮小せず、ソースからのサンプル位置の調整だけで最近傍に縮小する」案は効果が小さい**。色変換が結局 swscale の汎用処理を通り、最近傍のサンプリングは 1 行あたりのスライスが 2 回になってコピーが重くなるため（cover で合計 14.9ms、今の方式は約 12.6ms）。
-- **描画は、libavfilter の `transpose` で LCD の物理的な並びに回転してから書く**。rotate=90 では論理画面の 1 列が物理的な 1 行なので、回転済みの画像は物理行ごとの連続コピーになり、cover（高さ 240 = 物理幅いっぱい）では 1 回のコピーで済む。
-  swscale（`scale=...:flags=fast_bilinear`）→ `format=rgb565le` → `transpose` を 1 つのフィルタグラフにまとめる（`RawScaler(transpose="clock")`）。
-  縮小・色変換・回転・書き込みの合計: fit 9.06→4.88ms、cover 12.32→6.11ms。出力は従来の経路と 1 画素も違わない（rotate=90/270 の両方で確認）。
-  - Python のループ展開（4 列ずつ）は効かない（4.33→4.22ms）。重いのはループの制御ではなく、1 反復ごとのスライスオブジェクトの生成なので、ループそのものを C（libavfilter）に移すほうが効く。
-  - `pad` は RGB565 に対応しておらず rgb24 に変換されてしまう。ソース側（YUYV）で黒帯を足すとかえって遅い（6.01ms）ので、fit では物理行ごとにコピーしている。
+- **回転（試して、やめた）**: libavfilter の `transpose` で LCD の物理的な並びに回転してから書くと、描画は物理行ごとの連続コピー（cover では 1 回のコピー）になり、
+  縮小・色変換・回転・書き込みの合計は fit 9.06→4.88ms、cover 12.32→6.11ms まで下がった（出力は従来と 1 画素も違わない）。
+  ただし libavfilter は PyAV 経由でしか使えず、PyAV の読み込みが起動を 10 秒以上遅らせるので、Python の列ごとの blit に戻した（cover で 48fps。パネルの上限 45fps は超えている）。
+  - Python のループ展開（4 列ずつ）は効かない（4.33→4.22ms）。重いのはループの制御ではなく、1 反復ごとのスライスオブジェクトの生成なので、ループそのものを C に移すほうが効く。
+  - `pad` は RGB565 に対応しておらず rgb24 に変換されてしまう。ソース側（YUYV）で黒帯を足すとかえって遅い（6.01ms）。
+
+#### 起動が遅い → PyAV をやめて libswscale を ctypes で呼ぶ
+
+ストアからインストールした直後の初回起動が非常に遅かった。計測すると、`import av` だけで 10–22 秒かかっていた。
+
+- 端末の PyAV は pip の wheel で、FFmpeg 一式を同梱している。`import av` で **83 個の共有ライブラリ（ディスク上 58MB）** を map する（libavcodec 12MB、SVT-AV1 2.8MB、gnutls、libvpx など）。
+- RAM は 119MB で、swap（59MB）もほぼ満杯（tailscaled、NanoKVM-Server、kvm_ui がそれぞれ 10–17MB を swap に出している）。そこに 58MB のライブラリを読み込むのでスラッシングが起き、ページキャッシュが温まっていても 10 秒以上かかる。キャッシュを捨てた状態では 22 秒だった。
+- 使っているのは swscale だけ。wheel に同梱の `libswscale-*.so`（797KB）と `libavutil-*.so`（664KB）は libc/libm/libpthread にしか依存しないので、ctypes でこれだけを読み込み、`sws_getContext` / `sws_scale` を直接呼ぶ。
+  システムの `libavutil.so.59` は X11 や VA-API、OpenCL などに依存しているので使わない。
+- 結果: 起動から最初のフレームまで約 1.6 秒。プロセスの RSS は 11.7MB（`import av` するだけで約 16MB 使っていた）。出力は PyAV の `reformat`（FAST_BILINEAR）と 64800 画素すべて一致した。
 
 `blit_rgb565()` は appbase にビットマップ描画 API がないため、`FrameBuffer._buf`（非公開属性）へ直接書き込む。
 
