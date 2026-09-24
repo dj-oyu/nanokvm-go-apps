@@ -1,0 +1,9 @@
+{
+  "app_id": "io.github.dj_oyu.vin_preview",
+  "name": "VIN Preview",
+  "creator": "dj-oyu",
+  "create_time": "2026-09-25",
+  "version": "0.2.0",
+  "desc": "Low-latency HDMI input preview on the panel. Reads VIN frames straight from memory; double tap to zoom, swipe to pan.",
+  "category": "tool"
+}
